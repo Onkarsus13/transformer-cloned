@@ -370,6 +370,7 @@ class VideoTextDataset(Dataset):
             "attention_mask": encoded_text["attention_mask"].squeeze(0),
             "text": caption,
         }
+        example["video_path"] = str(sample.video)
 
         if pixel_attention_mask is not None:
             example["pixel_attention_mask"] = pixel_attention_mask

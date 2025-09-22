@@ -5,9 +5,10 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
+import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -29,6 +30,7 @@ from .sg_match_model import (
     SiglipVideoTextMatcher,
     compute_retrieval_metrics,
 )
+from .dinov3_dense import DinoV3ParallelVideoTextMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-root", type=Path, help="Optional root dir to prepend to relative video paths.")
     parser.add_argument("--negative-text-column", type=str, help="Column in metadata containing explicit negatives.")
     parser.add_argument("--pretrained", type=str, default="google/siglip2-large-patch16-512")
+    parser.add_argument("--model-type", choices=["siglip", "dinov3"], default="siglip")
+    parser.add_argument("--vision-model-name", type=str, default="facebook/dinov3-vit7b16-pretrain-lvd1689m")
+    parser.add_argument("--text-model-name", type=str, default="google/umt5-xxxl")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
 
     parser.add_argument("--num-epochs", type=int, default=5)
@@ -58,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-text-length", type=int, default=77)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--num-layers", type=int, default=3)
+    parser.add_argument("--fusion-heads", type=int, default=16)
+    parser.add_argument("--fusion-mlp-ratio", type=float, default=4.0)
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=float, default=32.0)
+    parser.add_argument("--lora-dropout", type=float, default=0.1)
     parser.add_argument("--random-start", action="store_true")
 
     parser.add_argument("--seed", type=int, default=42)
@@ -88,33 +98,63 @@ def setup_logging(output_dir: Path) -> None:
     logging.getLogger().addHandler(fh)
 
 
-def load_models(args: argparse.Namespace) -> SiglipVideoTextMatcher:
-    logger.info("Loading SigLIP2 models from %s", args.pretrained)
-    vision = Siglip2VisionModel.from_pretrained(args.pretrained)
-    text = Siglip2TextModel.from_pretrained(args.pretrained)
+def load_training_components(
+    args: argparse.Namespace,
+) -> tuple[nn.Module, Any, Any]:
+    if args.model_type == "siglip":
+        logger.info("Loading SigLIP2 models from %s", args.pretrained)
+        processor = Siglip2Processor.from_pretrained(args.pretrained)
+        vision = Siglip2VisionModel.from_pretrained(args.pretrained)
+        text = Siglip2TextModel.from_pretrained(args.pretrained)
 
-    model = SiglipVideoTextMatcher(
-        vision_model=vision,
-        text_model=text,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        max_position_embeddings=args.num_frames + args.max_text_length + 2,
-    )
+        model = SiglipVideoTextMatcher(
+            vision_model=vision,
+            text_model=text,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            max_position_embeddings=args.num_frames + args.max_text_length + 2,
+        )
 
-    if args.freeze_vision:
-        for param in model.vision_model.parameters():
-            param.requires_grad = False
-    if args.freeze_text:
-        for param in model.text_model.parameters():
-            param.requires_grad = False
+        if args.freeze_vision:
+            for param in model.vision_model.parameters():
+                param.requires_grad = False
+        if args.freeze_text:
+            for param in model.text_model.parameters():
+                param.requires_grad = False
 
-    return model
+        return model, processor.image_processor, processor.tokenizer
+
+    if args.model_type == "dinov3":
+        logger.info(
+            "Loading DINOv3 vision model %s and text encoder %s",
+            args.vision_model_name,
+            args.text_model_name,
+        )
+
+        model = DinoV3ParallelVideoTextMatcher(
+            vision_model_name=args.vision_model_name,
+            text_model_name=args.text_model_name,
+            hidden_dim=None,
+            projection_dim=None,
+            num_layers=args.num_layers,
+            num_heads=args.fusion_heads,
+            dropout=args.dropout,
+            mlp_ratio=args.fusion_mlp_ratio,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            freeze_text_encoder=args.freeze_text,
+        )
+        return model, model.image_processor, model.tokenizer
+
+    raise ValueError(f"Unsupported model_type '{args.model_type}'")
 
 
 def create_dataloader(
     *,
     metadata_path: Path,
-    processor: Siglip2Processor,
+    image_processor: Any,
+    tokenizer: Any,
     args: argparse.Namespace,
     shuffle: bool,
     batch_size: int,
@@ -122,7 +162,8 @@ def create_dataloader(
 ) -> DataLoader:
     dataset = VideoTextDataset(
         metadata=metadata_path,
-        processor=processor,
+        image_processor=image_processor,
+        tokenizer=tokenizer,
         video_root=args.video_root,
         negative_text_column=args.negative_text_column,
         num_frames=args.num_frames,
@@ -131,7 +172,7 @@ def create_dataloader(
         max_text_length=args.max_text_length,
         num_negatives=args.num_negatives,
     )
-    collator = ContrastiveVideoTextCollator(processor.tokenizer, mlm_probability=mlm_probability)
+    collator = ContrastiveVideoTextCollator(tokenizer, mlm_probability=mlm_probability)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -151,19 +192,21 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor], device: torch.device) -
             out[key] = value.to(device, non_blocking=True)
         else:
             out[key] = value
-    if "pixel_attention_mask" not in out:
-        mask = torch.ones_like(out["pixel_values"][..., 0], dtype=torch.long)
-        out["pixel_attention_mask"] = mask
-    if "spatial_shapes" not in out:
-        batch_size, num_frames, patch_count, _ = out["pixel_values"].shape
-        height = width = int(math.sqrt(patch_count))
-        spatial = torch.full((batch_size, num_frames, 2), height, device=device, dtype=torch.long)
-        out["spatial_shapes"] = spatial
+    pixel_values = out.get("pixel_values")
+    if isinstance(pixel_values, torch.Tensor) and pixel_values.ndim == 4:
+        if "pixel_attention_mask" not in out:
+            mask = torch.ones_like(pixel_values[..., 0], dtype=torch.long)
+            out["pixel_attention_mask"] = mask
+        if "spatial_shapes" not in out:
+            batch_size, num_frames, patch_count, _ = pixel_values.shape
+            height = width = int(math.sqrt(patch_count))
+            spatial = torch.full((batch_size, num_frames, 2), height, device=device, dtype=torch.long)
+            out["spatial_shapes"] = spatial
     return out
 
 
 def prepare_optimizer(
-    model: SiglipVideoTextMatcher,
+    model: nn.Module,
     args: argparse.Namespace,
     train_steps: int,
 ) -> tuple[torch.optim.Optimizer, int]:
@@ -175,7 +218,7 @@ def prepare_optimizer(
 
 def save_checkpoint_state(
     *,
-    model: SiglipVideoTextMatcher,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
     epoch: int,
@@ -194,7 +237,7 @@ def save_checkpoint_state(
 def load_checkpoint(
     *,
     path: Path,
-    model: SiglipVideoTextMatcher,
+    model: nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
 ) -> tuple[int, int]:
@@ -208,7 +251,7 @@ def load_checkpoint(
 
 
 def evaluate(
-    model: SiglipVideoTextMatcher,
+    model: nn.Module,
     dataloader: DataLoader,
     accelerator: Accelerator,
 ) -> Dict[str, float]:
@@ -219,14 +262,17 @@ def evaluate(
         progress = tqdm(dataloader, desc="Eval", leave=False, disable=not accelerator.is_main_process)
         for batch in progress:
             batch_on_device = move_batch_to_device(batch, accelerator.device)
-            outputs = model(
-                pixel_values=batch_on_device["pixel_values"],
-                pixel_attention_mask=batch_on_device["pixel_attention_mask"],
-                spatial_shapes=batch_on_device["spatial_shapes"],
-                input_ids=batch_on_device["input_ids"],
-                attention_mask=batch_on_device["attention_mask"],
-                return_loss=False,
-            )
+            model_inputs = {
+                "pixel_values": batch_on_device["pixel_values"],
+                "input_ids": batch_on_device["input_ids"],
+                "attention_mask": batch_on_device["attention_mask"],
+                "return_loss": False,
+            }
+            for key in ("pixel_attention_mask", "spatial_shapes"):
+                if key in batch_on_device:
+                    model_inputs[key] = batch_on_device[key]
+
+            outputs = model(**model_inputs)
             video_embeds.append(outputs.video_embeddings)
             text_embeds.append(outputs.text_embeddings)
 
@@ -265,28 +311,30 @@ def train() -> None:
     if accelerator.is_main_process:
         logger.info("Using device(s): %s", accelerator.device)
 
-    processor = Siglip2Processor.from_pretrained(args.pretrained)
+    model, image_processor, tokenizer = load_training_components(args)
+
+    mlm_probability = args.mlm_probability if args.model_type != "dinov3" else 0.0
     train_loader = create_dataloader(
         metadata_path=args.train_metadata,
-        processor=processor,
+        image_processor=image_processor,
+        tokenizer=tokenizer,
         args=args,
         shuffle=True,
         batch_size=args.batch_size,
-        mlm_probability=args.mlm_probability,
+        mlm_probability=mlm_probability,
     )
 
     eval_loader = None
     if args.eval_metadata:
         eval_loader = create_dataloader(
             metadata_path=args.eval_metadata,
-            processor=processor,
+            image_processor=image_processor,
+            tokenizer=tokenizer,
             args=args,
             shuffle=False,
             batch_size=args.eval_batch_size,
             mlm_probability=0.0,
         )
-
-    model = load_models(args)
 
     updates_per_epoch = math.ceil(len(train_loader) / args.gradient_accumulation_steps)
     total_steps = updates_per_epoch * args.num_epochs
@@ -329,7 +377,7 @@ def train() -> None:
         running_loss = 0.0
         contrastive_meter = 0.0
         mlm_meter = 0.0
-        negative_meter = 0.0
+        matching_meter = 0.0
         step_in_epoch = 0
 
         progress = tqdm(
@@ -344,16 +392,17 @@ def train() -> None:
         for batch in train_loader:
             with accelerator.accumulate(model):
                 batch_on_device = move_batch_to_device(batch, accelerator.device)
-                outputs = model(
-                    pixel_values=batch_on_device["pixel_values"],
-                    pixel_attention_mask=batch_on_device["pixel_attention_mask"],
-                    spatial_shapes=batch_on_device["spatial_shapes"],
-                    input_ids=batch_on_device["input_ids"],
-                    attention_mask=batch_on_device["attention_mask"],
-                    labels=batch_on_device["labels"],
-                    negative_input_ids=batch_on_device.get("negative_input_ids"),
-                    negative_attention_mask=batch_on_device.get("negative_attention_mask"),
-                )
+                model_inputs = {
+                    "pixel_values": batch_on_device["pixel_values"],
+                    "input_ids": batch_on_device["input_ids"],
+                    "attention_mask": batch_on_device["attention_mask"],
+                    "labels": batch_on_device["labels"],
+                }
+                for key in ("pixel_attention_mask", "spatial_shapes", "negative_input_ids", "negative_attention_mask"):
+                    if key in batch_on_device and batch_on_device[key] is not None:
+                        model_inputs[key] = batch_on_device[key]
+
+                outputs = model(**model_inputs)
 
                 accelerator.backward(outputs.loss)
 
@@ -372,9 +421,12 @@ def train() -> None:
                 if outputs.mlm_loss is not None:
                     mlm_value = accelerator.gather(outputs.mlm_loss.detach()).mean().item()
                     mlm_meter += mlm_value
-                if outputs.negative_loss is not None:
-                    negative_value = accelerator.gather(outputs.negative_loss.detach()).mean().item()
-                    negative_meter += negative_value
+                matching_component = getattr(outputs, "video_text_matching_loss", None)
+                if matching_component is None:
+                    matching_component = getattr(outputs, "negative_loss", None)
+                if matching_component is not None:
+                    matching_value = accelerator.gather(matching_component.detach()).mean().item()
+                    matching_meter += matching_value
 
                 global_step += 1
                 step_in_epoch += 1
@@ -388,7 +440,7 @@ def train() -> None:
                         "loss": avg_loss,
                         "contrastive": contrastive_meter / max(1, step_in_epoch),
                         "mlm": mlm_meter / max(1, step_in_epoch),
-                        "neg": negative_meter / max(1, step_in_epoch),
+                        "video_text_matching": matching_meter / max(1, step_in_epoch),
                         "lr": scheduler.get_last_lr()[0],
                     }
                     logger.info(json.dumps(msg))
@@ -417,8 +469,13 @@ def train() -> None:
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        final_model = accelerator.unwrap_model(model)
         final_path = args.output_dir / "model_final.pt"
-        accelerator.save(accelerator.unwrap_model(model).state_dict(), final_path)
+        accelerator.save(final_model.state_dict(), final_path)
+        if args.model_type == "dinov3":
+            adapter_dir = args.output_dir / "dino_parallel"
+            final_model.save_pretrained(adapter_dir)
+            logger.info("Saved LoRA adapter and fusion head to %s", adapter_dir)
         logger.info("Training complete. Final weights saved to %s", final_path)
 
 
